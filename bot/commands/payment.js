@@ -1,230 +1,256 @@
-const ADMIN_CHAT_ID = '948172585';
-const userState = {};
+// commands/payment.js
+const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID) || 948172585;
+
+const userState = {}; // chatId -> { active, step, data }
+
+function cancelFlowIfAny(chatId) {
+  if (userState[chatId]?.active) {
+    userState[chatId] = { active: false, step: "idle" };
+  }
+}
 
 function startPaymentFlow(bot, chatId) {
-	userState[chatId] = { step: 'name' };
-	bot.sendMessage(chatId, 'Введите вашу Фамилию и Имя:');
+  userState[chatId] = {
+    active: true,
+    step: "fio",
+    data: {},
+  };
+
+  bot.sendMessage(
+    chatId,
+    "🧾 Оплата участия в мастер-классе: *45 BYN*\n\nВведите вашу *Фамилию и Имя*:",
+    { parse_mode: "Markdown" }
+  );
+}
+
+function askAge(bot, chatId) {
+  bot.sendMessage(chatId, "Введите ваш *возраст* (от 16 до 80):", {
+    parse_mode: "Markdown",
+  });
+}
+
+function askInstagram(bot, chatId) {
+  bot.sendMessage(chatId, "Введите ваш *Instagram* (например: @nickname):", {
+    parse_mode: "Markdown",
+  });
+}
+
+function showPaymentInstruction(bot, chatId) {
+  const s = userState[chatId];
+  if (!s) return;
+
+  bot.sendMessage(
+    chatId,
+    `Проверьте данные:\n\n` +
+      `👤 ФИО: ${s.data.fio}\n` +
+      `🎂 Возраст: ${s.data.age}\n` +
+      `📸 Instagram: ${s.data.instagram}\n\n` +
+      `💳 *К оплате: 45 BYN*\n\n` +
+      `Оплата на карту:\n` +
+      `• 4255 1901 3306 4249\n` +
+      `• 01/26\n` +
+      `• Беларусбанк\n\n` +
+      `После перевода отправьте *фото чека* сюда.`,
+    { parse_mode: "Markdown" }
+  );
+
+  // уведомляем админа + INLINE-кнопки подтверждения/отклонения
+  bot.sendMessage(
+    ADMIN_CHAT_ID,
+    `📋 Пользователь начал оплату (45 BYN):\n` +
+      `👤 ${s.data.fio}\n🎂 ${s.data.age}\n📸 ${s.data.instagram}\n` +
+      `🆔 @${s.data.tgNick || "—"}\n\n` +
+      `Чек придёт следующим сообщением.`,
+    {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ Подтвердить", callback_data: `pay:ok:${chatId}` },
+          { text: "❌ Отклонить",   callback_data: `pay:no:${chatId}` },
+        ]],
+      },
+    }
+  );
+
+  s.step = "waiting_receipt";
 }
 
 function setupPayment(bot) {
-	bot.on('message', (msg) => {
-		const chatId = msg.chat.id;
-		const state = userState[chatId];
+  // утилита безопасной отправки сообщений
+  async function safeSend(toChatId, payload, onError) {
+    try {
+      return await bot.sendMessage(toChatId, payload.text, payload.opts || {});
+    } catch (err) {
+      if (onError) onError(err);
+      return null;
+    }
+  }
 
-		if (!state || msg.text?.startsWith('/')) return;
+  // утилиты редактирования карточки у админа
+  function disableInline(msg) {
+    // убрать кнопки
+    const opts = { chat_id: msg.chat.id, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } };
+    if (msg.caption) return bot.editMessageCaption(msg.caption, opts).catch(() => {});
+    return bot.editMessageReplyMarkup({ inline_keyboard: [] }, opts).catch(() => {});
+  }
+  function setStatusOnAdminCard(msg, statusLine) {
+    const opts = { chat_id: msg.chat.id, message_id: msg.message_id, reply_markup: { inline_keyboard: [] }, parse_mode: "Markdown" };
+    if (msg.caption) {
+      const updated = msg.caption + `\n\n${statusLine}`;
+      return bot.editMessageCaption(updated, { ...opts }).catch(() => {});
+    } else if (msg.text) {
+      const updated = msg.text + `\n\n${statusLine}`;
+      return bot.editMessageText(updated, { ...opts }).catch(() => {});
+    }
+  }
 
-		switch (state.step) {
-			case 'name':
-				state.fullName = msg.text;
-				state.step = 'insta';
-				bot.sendMessage(chatId, 'Введите ваш ник в Instagram:');
-				break;
+  // основной сценарий оплаты
+  bot.on("message", (msg) => {
+    const chatId = msg.chat.id;
+    const text = msg.text;
+    const s = userState[chatId];
 
-			case 'insta':
-				state.instaNick = msg.text;
-				state.step = 'package';
+    if (!s?.active) return;
+    if (text && text.startsWith("/")) return;
 
-				const options = {
-					reply_markup: {
-						inline_keyboard: [
-							[
-								{ text: 'FULL PASS (5 классов) - 100 BYN', callback_data: 'full' },
-								{ text: 'HALF PASS (3 класса) - 80 BYN', callback_data: 'half' },
-								{ text: 'ONE PASS (1 класс) - 30 BYN', callback_data: 'one' }
-							]
-						]
-					}
-				};
+    switch (s.step) {
+      case "fio": {
+        if (
+          !text ||
+          !/^[A-Za-zА-Яа-яЁёІіЇїЄє'’\-]+\s+[A-Za-zА-Яа-яЁёІіЇїЄє'’\-]+$/.test(
+            text.trim()
+          )
+        ) {
+          bot.sendMessage(chatId, "Пожалуйста, введите Фамилию и Имя через пробел.");
+          return;
+        }
+        s.data.fio = text.trim();
+        s.data.tgNick = msg.from?.username || null;
+        s.step = "age";
+        return askAge(bot, chatId);
+      }
 
-				bot.sendMessage(chatId, 'Выберите пакет участия:', options);
-				break;
+      case "age": {
+        const age = Number(text?.trim());
+        if (!Number.isInteger(age) || age < 16 || age > 80) {
+          bot.sendMessage(
+            chatId,
+            "Возраст должен быть *числом* от 16 до 80.",
+            { parse_mode: "Markdown" }
+          );
+          return;
+        }
+        s.data.age = age;
+        s.step = "instagram";
+        return askInstagram(bot, chatId);
+      }
 
-			case 'waiting_photo':
-				if (!msg.photo) {
-					bot.sendMessage(chatId, 'Пожалуйста, отправьте фото чека.');
-					return;
-				}
+      case "instagram": {
+        if (!/^@[\w.\-]{2,}$/.test(String(text).trim())) {
+          bot.sendMessage(chatId, "Ник должен начинаться с @ (например: @nickname).");
+          return;
+        }
+        s.data.instagram = text.trim();
+        return showPaymentInstruction(bot, chatId);
+      }
 
-				const fileId = msg.photo[msg.photo.length - 1].file_id;
+      case "waiting_receipt": {
+        if (!msg.photo && !msg.document) {
+          bot.sendMessage(chatId, "Пожалуйста, отправьте *фото чека*.", {
+            parse_mode: "Markdown",
+          });
+          return;
+        }
 
-				bot.sendPhoto(ADMIN_CHAT_ID, fileId, {
-					caption: `
-📥 Новый платеж:
-👤 Имя: ${state.fullName}
-📸 Instagram: ${state.instaNick}
-🎟 Пакет: ${state.packageText}
-🧑‍🏫 Хореографы: ${state.selectedChoreographers?.join(', ') || '—'}
-🆔 Telegram: @${msg.from.username || 'нет ника'}
+        const fileId = msg.photo
+          ? msg.photo[msg.photo.length - 1].file_id
+          : msg.document.file_id;
 
-Подтвердить запись?`,
-					reply_markup: {
-						inline_keyboard: [
-							[
-								{ text: '✅ Подтвердить', callback_data: `confirm_${chatId}` },
-								{ text: '❌ Отклонить', callback_data: `reject_${chatId}` }
-							]
-						]
-					}
-				});
+        // отправляем чек админу вместе с кнопками подтверждения/отклонения
+        bot.sendPhoto(ADMIN_CHAT_ID, fileId, {
+          caption:
+            `📥 Новый платёж (45 BYN)\n` +
+            `👤 ${s.data.fio}\n🎂 ${s.data.age}\n📸 ${s.data.instagram}\n` +
+            `🆔 @${s.data.tgNick || "—"}`,
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "✅ Подтвердить", callback_data: `pay:ok:${chatId}` },
+              { text: "❌ Отклонить",   callback_data: `pay:no:${chatId}` },
+            ]],
+          },
+        }).catch(() => {});
 
-				state.step = 'done';
-				bot.sendMessage(chatId, 'Чек получен. Ожидайте подтверждения от администратора.');
-				break;
-		}
-	});
+        s.active = false;
+        s.step = "done";
+        bot.sendMessage(chatId, "✅ Чек получен. Ожидайте подтверждения!");
+        return;
+      }
+    }
+  });
 
-	bot.on('callback_query', (query) => {
-		const data = query.data;
-		const chatId = query.message.chat.id;
-		const state = userState[chatId];
+  // обработка кликов админа по inline-кнопкам
+  bot.on("callback_query", async (q) => {
+    const data = q.data || "";
+    const adminChatId = q.message?.chat?.id;
 
-		if (data.startsWith('confirm_')) {
-			const userChatId = data.split('_')[1];
-			bot.sendMessage(userChatId, '✅ Вы успешно записаны! До встречи на занятиях!');
-			bot.answerCallbackQuery(query.id, { text: 'Запись подтверждена.' });
-			return;
-		}
+    // защита: только админ может жать эти кнопки
+    if (adminChatId !== ADMIN_CHAT_ID) {
+      return bot.answerCallbackQuery(q.id, { text: "Нет прав", show_alert: true });
+    }
 
-		if (data.startsWith('reject_')) {
-			const userChatId = data.split('_')[1];
-			bot.sendMessage(userChatId, `
-❌ Ваша запись была отклонена администратором.
+    if (!data.startsWith("pay:")) return;
 
-Если у вас остались вопросы — напишите в Telegram: @galinskaaya`);
-			bot.answerCallbackQuery(query.id, { text: 'Запись отклонена.' });
-			return;
-		}
+    const [, action, userChatIdStr] = data.split(":");
+    const userChatId = Number(userChatIdStr);
 
-		// Выбор пакета
-		if (state?.step === 'package') {
-			let packageText = '';
-			switch (data) {
-				case 'full':
-					packageText = 'FULL PASS (5 классов) - 100 BYN';
-					break;
-				case 'half':
-					packageText = 'HALF PASS (3 класса) - 80 BYN';
-					break;
-				case 'one':
-					packageText = 'ONE PASS (1 класс) - 30 BYN';
-					break;
-			}
+    if (!userChatId) {
+      return bot.answerCallbackQuery(q.id, { text: "Некорректный ID", show_alert: true });
+    }
 
-			state.packageText = packageText;
-			state.packageType = data;
+    if (action === "ok") {
+      // пытаемся уведомить пользователя
+      let delivered = true;
+      try {
+        await bot.sendMessage(
+          userChatId,
+          "✅ Оплата подтверждена! До встречи на мастер-классе *15.11, 18:00–20:00*.\nМесто: TORITEAM STUDIO, г. Новополоцк, ул. Дзержинского 17/2 (вход со двора)",
+          { parse_mode: "Markdown" }
+        );
+      } catch (err) {
+        delivered = false;
+        bot.answerCallbackQuery(q.id, { text: "Пользователь недоступен (возможно, заблокировал бота).", show_alert: true }).catch(()=>{});
+      }
 
-			const priceMatch = packageText.match(/(\d+)\s*BYN/);
-			const price = priceMatch ? priceMatch[1] : '—';
+      // помечаем карточку у админа и убираем кнопки
+      await setStatusOnAdminCard(q.message, delivered ? "✅ Подтверждено и отправлено пользователю." : "⚠️ Подтверждено, но пользователю отправить не удалось.").catch(()=>{});
+      await disableInline(q.message);
 
-			if (data === 'full') {
-				state.step = 'waiting_photo';
-				bot.sendMessage(chatId, `
-Спасибо! Вот ваши данные:
-👤 Имя: ${state.fullName}
-📸 Instagram: ${state.instaNick}
-🎟 Пакет: ${packageText}
-💰 Сумма к оплате: ${price} BYN
+      return bot.answerCallbackQuery(q.id).catch(()=>{});
+    }
 
-Оплата безналичным переводом на карту:  
-💳 4255 1901 3306 4249  
-📅 01/26  
-🏦 Беларусбанк  
+    if (action === "no") {
+      // пытаемся уведомить пользователя
+      let delivered = true;
+      try {
+        await bot.sendMessage(
+          userChatId,
+          "❌ Оплата отклонена. Напишите, пожалуйста, @galinskaaya"
+        );
+      } catch (err) {
+        delivered = false;
+        bot.answerCallbackQuery(q.id, { text: "Пользователь недоступен (возможно, заблокировал бота).", show_alert: true }).catch(()=>{});
+      }
 
-После перевода пришлите, пожалуйста, фото чека сюда.`);
-				bot.answerCallbackQuery(query.id);
-				return;
-			}
+      // помечаем карточку у админа и убираем кнопки
+      await setStatusOnAdminCard(q.message, delivered ? "❌ Отклонено и отправлено пользователю." : "⚠️ Отклонено, но пользователю отправить не удалось.").catch(()=>{});
+      await disableInline(q.message);
 
-			// HALF или ONE → выбор хореографов
-			state.step = 'select_choreographers';
-			state.selectedChoreographers = [];
-			state.choreographers = ['ANUTKA LUV', 'KIDADA', 'SHAVUHA', 'ALEX ARLET', 'GALINSKAAYA'];
-
-			const keyboard = state.choreographers.map(name => {
-				return [{ text: `☐ ${name}`, callback_data: `choreo_${name}` }];
-			});
-			keyboard.push([{ text: '✅ Готово', callback_data: 'choreo_done' }]);
-
-			bot.sendMessage(chatId, `
-Выберите хореограф${data === 'one' ? 'а' : 'ов'}${data === 'half' ? ' (до 3-х)' : ''}:`, {
-				reply_markup: { inline_keyboard: keyboard }
-			});
-			bot.answerCallbackQuery(query.id);
-			return;
-		}
-
-		// Выбор хореографов
-		if (state?.step === 'select_choreographers') {
-			const type = state.packageType;
-
-			if (data === 'choreo_done') {
-				const count = state.selectedChoreographers.length;
-
-				if (type === 'one' && count !== 1) {
-					bot.answerCallbackQuery(query.id, { text: 'Выберите ровно одного хореографа.' });
-					return;
-				}
-				if (type === 'half' && count === 0) {
-					bot.answerCallbackQuery(query.id, { text: 'Выберите хотя бы одного хореографа.' });
-					return;
-				}
-
-				state.step = 'waiting_photo';
-				const choreoList = state.selectedChoreographers.join(', ');
-
-				bot.editMessageReplyMarkup(undefined, {
-					chat_id: chatId,
-					message_id: query.message.message_id
-				});
-
-				bot.sendMessage(chatId, `
-Спасибо! Вот ваши данные:
-👤 Имя: ${state.fullName}
-📸 Instagram: ${state.instaNick}
-🎟 Пакет: ${state.packageText}
-💰 Сумма к оплате: ${state.packageText.match(/(\d+)\s*BYN/)[1]} BYN
-🧑‍🏫 Хореографы: ${choreoList}
-
-Оплата безналичным переводом на карту:  
-💳 4255 1901 3306 4249  
-📅 01/26  
-🏦 Беларусбанк  
-
-После перевода пришлите, пожалуйста, фото чека сюда.`);
-				bot.answerCallbackQuery(query.id);
-				return;
-			}
-
-			const choreoName = data.replace('choreo_', '');
-			const index = state.selectedChoreographers.indexOf(choreoName);
-
-			if (index === -1) {
-				if (type === 'one' && state.selectedChoreographers.length >= 1) {
-					bot.answerCallbackQuery(query.id, { text: 'Можно выбрать только одного хореографа.' });
-					return;
-				}
-				if (type === 'half' && state.selectedChoreographers.length >= 3) {
-					bot.answerCallbackQuery(query.id, { text: 'Можно выбрать максимум 3 хореографа.' });
-					return;
-				}
-				state.selectedChoreographers.push(choreoName);
-			} else {
-				state.selectedChoreographers.splice(index, 1);
-			}
-
-			const updatedKeyboard = state.choreographers.map(name => {
-				const selected = state.selectedChoreographers.includes(name);
-				return [{ text: `${selected ? '✅' : '☐'} ${name}`, callback_data: `choreo_${name}` }];
-			});
-			updatedKeyboard.push([{ text: '✅ Готово', callback_data: 'choreo_done' }]);
-
-			bot.editMessageReplyMarkup({ inline_keyboard: updatedKeyboard }, {
-				chat_id: chatId,
-				message_id: query.message.message_id
-			});
-			bot.answerCallbackQuery(query.id);
-		}
-	});
+      return bot.answerCallbackQuery(q.id).catch(()=>{});
+    }
+  });
 }
 
-module.exports = { setupPayment, startPaymentFlow };
+module.exports = {
+  setupPayment,
+  startPaymentFlow,
+  cancelFlowIfAny,
+};
